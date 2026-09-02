@@ -5,8 +5,11 @@ import type { ESTree } from "meriyah";
 import type { ProbeContext } from "../../ProbeRunner.ts";
 import type { VariableTracer } from "../../VariableTracer.ts";
 import { CALL_EXPRESSION_DATA } from "../../contants.ts";
-import { isStringLiteral, isNumericLiteral, isIdentifier } from "../../estree/types.ts";
+import { isStringLiteral, isIdentifier, isNode } from "../../estree/types.ts";
 import { generateWarning } from "../../warnings.ts";
+import { resolveStringValue } from './resolveStringValue.ts';
+import { resolveNumericValue } from './resolveNumericValue.ts';
+import { findPropertyMatch } from '../../estree/functions/findPropertyMatch.ts';
 
 /**
  * OWASP recommended Argon2 parameter combinations.
@@ -37,48 +40,6 @@ const kMinNonceLength = 16;
 
 const kTracedFunctions = ["crypto.argon2", "crypto.argon2Sync"];
 
-interface Argon2Params {
-  memory: number | null;
-  passes: number | null;
-  nonce: string | null;
-}
-
-/**
- * Identify which parameter drags the call below the OWASP recommendations,
- * or null when the combination is acceptable.
- */
-function findWeakParam(
-  algorithm: string,
-  memory: number,
-  passes: number
-): "memory" | "passes" | null {
-  const rows = algorithm === "argon2i" ? kOWASPRowsForArgon2i : kOWASPRows;
-
-  // Rows are sorted by ascending passes, and the memory requirement drops as
-  // passes grow. The last usable row is therefore the cheapest one available.
-  const row = rows.findLast(([, minPasses]) => passes >= minPasses);
-  if (row === undefined) {
-    return "passes";
-  }
-
-  return memory < row[0] ? "memory" : null;
-}
-
-/**
- * Resolve the static name of a property key.
- * Returns null for a computed key built from a variable, since its value is
- * only known at runtime.
- */
-function getPropertyName(
-  prop: ESTree.Property
-): string | null {
-  if (!prop.computed && isIdentifier(prop.key)) {
-    return prop.key.name;
-  }
-
-  return isStringLiteral(prop.key) ? prop.key.value : null;
-}
-
 /**
  * Read a string out of a node, following identifiers assigned a string literal.
  * TemplateLiteral assignments are ignored because the tracer stores them with
@@ -101,56 +62,24 @@ function resolveString(
 }
 
 /**
- * Read a number out of a node, following identifiers assigned a numeric
- * literal. The tracer stores every literal as a string, hence the conversion.
+ * Identify which parameter drags the call below the OWASP recommendations,
+ * or null when the combination is acceptable.
  */
-function resolveNumber(
-  node: ESTree.Node | undefined,
-  tracer: VariableTracer
-): number | null {
-  if (isNumericLiteral(node)) {
-    return node.value;
-  }
-  if (isIdentifier(node)) {
-    const literal = tracer.literalIdentifiers.get(node.name);
-    if (literal?.type !== "Literal") {
-      return null;
-    }
-    const value = Number(literal.value);
+function findWeakParam(
+  algorithm: string,
+  memory: number,
+  passes: number
+): "memory" | "passes" | null {
+  const rows = algorithm === "argon2i" ? kOWASPRowsForArgon2i : kOWASPRows;
 
-    return Number.isNaN(value) ? null : value;
+  // Rows are sorted by ascending passes, and the memory requirement drops as
+  // passes grow. The last usable row is therefore the cheapest one available.
+  const row = rows.findLast(([, minPasses]) => passes >= minPasses);
+  if (row === undefined) {
+    return "passes";
   }
 
-  return null;
-}
-
-function extractParams(
-  properties: ESTree.ObjectExpression["properties"],
-  tracer: VariableTracer
-): Argon2Params {
-  const params: Argon2Params = { memory: null, passes: null, nonce: null };
-
-  for (const prop of properties) {
-    if (prop.type !== "Property") {
-      continue;
-    }
-
-    switch (getPropertyName(prop)) {
-      case "memory":
-        params.memory = resolveNumber(prop.value, tracer);
-        break;
-      case "passes":
-        params.passes = resolveNumber(prop.value, tracer);
-        break;
-      case "nonce":
-        params.nonce = resolveString(prop.value, tracer);
-        break;
-      default:
-        break;
-    }
-  }
-
-  return params;
+  return memory < row[0] ? "memory" : null;
 }
 
 function validateNode(
@@ -183,7 +112,7 @@ function main(node: ESTree.CallExpression, ctx: ProbeContext) {
   const { sourceFile } = ctx;
   const { tracer } = sourceFile;
 
-  const algorithm = resolveString(node.arguments.at(0), tracer);
+  const algorithm = resolveStringValue(node.arguments.at(0), tracer.literalIdentifiers);
   if (algorithm === null) {
     return;
   }
@@ -202,7 +131,9 @@ function main(node: ESTree.CallExpression, ctx: ProbeContext) {
     return;
   }
 
-  const { memory, passes, nonce } = extractParams(options.properties, tracer);
+  const memory = resolveNumericValue(findPropertyMatch(options.properties, ["memory"], isNode), tracer.literalIdentifiers);
+  const passes = resolveNumericValue(findPropertyMatch(options.properties, ["passes"], isNode), tracer.literalIdentifiers);
+  const nonce = resolveStringValue(findPropertyMatch(options.properties, ["nonce"], isNode), tracer.literalIdentifiers);
 
   if (memory !== null && passes !== null) {
     const weakParam = findWeakParam(algorithm, memory, passes);
